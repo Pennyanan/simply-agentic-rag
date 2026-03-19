@@ -1,0 +1,13 @@
+.env
+data/
+ragenv/
+vectorstore/
+
+__pycache__/
+*.pyc
+
+*.png
+*.jpg
+
+usage_state.json
+temp_autosales_topn.csv

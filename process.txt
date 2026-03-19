@@ -1,0 +1,4 @@
+ragenv\Scripts\activate
+python app.py
+
+deactivate
