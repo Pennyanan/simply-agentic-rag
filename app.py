@@ -76,7 +76,7 @@ chart_tool = ChartTool()
 
 from duckduckgo_search import DDGS
 
-def web_search(query: str, max_results: int = 5) -> str:
+def web_search(query: str, max_results: int = 10) -> str:
     try:
         results = []
         with DDGS() as ddgs:
@@ -129,22 +129,27 @@ def autosales_query(query: str) -> str:
             lines.append(f"{len(lines)}. {row.get('title','未知')} — {int(row['review_count'])}")
         return "\n".join(lines)
 
-    df = df.sort_values("review_count", ascending=False).head(20)
-    return df.to_string()
+    # 只回傳前 10 筆，避免 token 超限
+    df = df.sort_values("review_count", ascending=False).head(10)
+    lines = ["[AutoSales] Top 10\n"]
+    for i, (_, row) in enumerate(df.iterrows(), 1):
+        lines.append(f"{i}. {row.get('title', '未知')} — {int(row['review_count'])} reviews")
+    return "\n".join(lines)
+
 # =========================================================
 # Tools 映射表
 # =========================================================
 
 TOOL_IMPLS = {
-    "text_rag_query": lambda query, **_: text_rag_tool.query(query),
+    "text_rag_query":  lambda query, **_: text_rag_tool.query(query),
     "table_rag_query": lambda query, **_: table_rag_tool.query(query),
     "autosales_query": lambda query, **_: autosales_query(query),
-    "web_search": lambda query, max_results=5, **_: web_search(query, max_results),
-    "chart_generate": lambda spec, **_: chart_generate(spec),
+    "web_search":      lambda query, max_results=5, **_: web_search(query, max_results),
+    "chart_generate":  lambda **kwargs: chart_generate(kwargs.get("spec", {})),
 }
 
 # =========================================================
-# OpenAI tools schema（非常重要）
+# OpenAI tools schema
 # =========================================================
 
 TOOL_DEFS = [
@@ -203,10 +208,42 @@ TOOL_DEFS = [
         "type": "function",
         "function": {
             "name": "chart_generate",
-            "description": "生成統計圖表。",
+            "description": (
+                "生成統計圖表。必須傳入 spec 物件，包含 csv_name、x、y、chart_type。"
+                "內容定制： csv_name=auto_sales, x=title, y=review_count, "
+                "chart_type 可選 bar/barh/pie/line/scatter/box/hist。"
+            ),
             "parameters": {
                 "type": "object",
-                "properties": {"spec": {"type": "object"}},
+                "properties": {
+                    "spec": {
+                        "type": "object",
+                        "description": "圖表規格，必須包含 csv_name、x、y、chart_type。",
+                        "properties": {
+                            "csv_name": {
+                                "type": "string",
+                                "description": "固定填 auto_sales",
+                                "enum": ["auto_sales"]
+                            },
+                            "x": {
+                                "type": "string",
+                                "description": "固定填 title",
+                                "enum": ["title"]
+                            },
+                            "y": {
+                                "type": "string",
+                                "description": "固定填 review_count",
+                                "enum": ["review_count"]
+                            },
+                            "chart_type": {
+                                "type": "string",
+                                "description": "圖表類型",
+                                "enum": ["bar", "barh", "pie", "line", "scatter", "box", "hist"]
+                            }
+                        },
+                        "required": ["csv_name", "x", "y", "chart_type"]
+                    }
+                },
                 "required": ["spec"],
             },
         },
@@ -214,19 +251,22 @@ TOOL_DEFS = [
 ]
 
 # =========================================================
-# API retry（避免 429）
+# API retry（避免 429，指數退避）
 # =========================================================
 
-def safe_chat(payload, retry=4, delay=1.2):
+def safe_chat(payload, retry=5, delay=3):
     for i in range(retry):
         try:
             return client.chat.completions.create(**payload)
         except Exception as e:
+            print(f"[ERROR 完整訊息] {str(e)}")
             if "429" in str(e):
-                time.sleep(delay * (i + 1))
+                wait = delay * (2 ** i)  # 3, 6, 12, 24, 48 秒
+                print(f"[429] Rate limit，等待 {wait} 秒後重試（第 {i+1} 次）")
+                time.sleep(wait)
                 continue
             raise
-    raise Exception("多次 retry 後仍然 429 error")
+    raise Exception("多次 retry 後仍然 429 error，請稍後再試")
 
 # =========================================================
 # System prompt
@@ -248,61 +288,45 @@ def build_system_prompt():
 - 只要使用者提到「銷售量、前十名、排行、Top 10」等詞，就優先使用 autosales_query。
 - 若同時提到「畫圖、圖表、可視化、長條圖、圓餅圖」，則需再呼叫 chart_generate。
 - 回覆內容全部使用繁體中文。
-- 回答風格可以更自然、有溫度，例如：
-  「我來幫你比較一下～」、
-  「這個結果有點有趣，我解釋一下給你聽」。
+- 回答風格可以更自然、有溫度。
 
-你不會顯示你的思考過程，只會呈現最終友善且清楚的回答。
+【重要】當你已經取得足夠的資訊可以回答使用者問題時，請直接給出最終答案，不要再呼叫任何工具。
+每個工具只需呼叫一次，不要重複呼叫同一個工具。
+若工具回傳 status=error，請直接告知使用者錯誤原因，絕對不要重複呼叫同一個工具。
+
+【chart_generate 使用規則 - 非常重要】
+chart_generate 的 spec 必須嚴格使用以下格式：
+{{
+  "csv_name": "auto_sales",
+  "x": "title",
+  "y": "review_count",
+  "chart_type": "pie"  // 可選: bar / barh / pie / line / scatter / box / hist
+}}
+- x 欄位固定使用 "title"（書名）
+- y 欄位固定使用 "review_count"（評論數，作為銷售量代理）
+- csv_name 固定使用 "auto_sales"
+- 不要使用其他欄位名稱，否則會失敗
+- 若 chart_generate 回傳 status=error，不要重試，直接告知使用者
 
 【智能 Web Search 規則】
-你具備 web_search 工具，可搜尋外部最新資訊。
-
 請根據下列情況「自動決定」是否使用 web_search：
-
 1. 當使用者詢問的是「即時性、最新、今年、目前」等需要新資訊的問題。
-   例：今年的暢銷書是什麼？目前 Amazon 排行榜有哪些新變化？
-
 2. 當資料庫中（CSV / RAG）沒有足夠資訊可以回答時。
-
-3. 當使用者明確要求：
-   - 「查網路」
-   - 「找外部資料」
-   - 「搜尋最新資訊」
-   - 「網路上怎麼說？」
-
-4. 若你不確定答案是否更新過（如出版趨勢、業界新聞），可「先查一次」再回答。
-
-5. 使用網路搜尋後，你需要：
-   - 做整理與摘要
-   - 不要只 dump 原文
-   - 不要杜撰不存在的網址
-   - 一律使用自然、清楚的繁體中文說明
-
+3. 當使用者明確要求查網路。
 web_search 只在確定需要時才使用，不需要每題都查。
-
 """
 
-
 # =========================================================
-# 單階段工具推理（符合 OpenAI 新規範，不會 400）
+# 工具函式
 # =========================================================
 import re
 
 def extract_top_n(user_query: str) -> int:
-    """
-    從使用者自然語言智能擷取「前 N 名」
-    default = 10
-    """
-    # 移除雜訊詞
     q = user_query.replace("名", "").replace("前", "").replace("第", "").lower()
-
-    # 尋找阿拉伯數字
     nums = re.findall(r"\d+", q)
     if nums:
         n = int(nums[0])
-        return max(1, min(n, 100))  # 限制避免無限大
-
-    # 中文數字補丁
+        return max(1, min(n, 100))
     mapping = {
         "一": 1, "二": 2, "三": 3, "四": 4, "五": 5,
         "六": 6, "七": 7, "八": 8, "九": 9, "十": 10,
@@ -311,15 +335,10 @@ def extract_top_n(user_query: str) -> int:
     for zh, num in mapping.items():
         if zh in user_query:
             return num
-
     return 10
-def extract_chart_type(user_query: str) -> str:
-    """
-    從使用者語句判斷要畫哪種圖
-    default = barh
-    """
-    q = user_query.lower()
 
+def extract_chart_type(user_query: str) -> str:
+    q = user_query.lower()
     if any(w in q for w in ["圓餅", "pie"]):
         return "pie"
     if any(w in q for w in ["折線", "趨勢", "line"]):
@@ -334,52 +353,69 @@ def extract_chart_type(user_query: str) -> str:
         return "barh"
     if any(w in q for w in ["長條", "bar"]):
         return "bar"
-
     return "barh"
 
+# =========================================================
+# ReAct Agent Loop
+# =========================================================
+
 def agent_run(user_query: str) -> Tuple[str, Optional[str]]:
-    # ---------------------------------------------------------
-    # 智能 Web Search 啟動前置提示（不會影響工具呼叫格式）
-    # ---------------------------------------------------------
+
+    MAX_ITERATIONS = 8
+
     web_keywords = ["最新", "現在", "目前", "今年", "外部", "網路", "google", "搜尋", "news", "新聞"]
     needs_web = any(k in user_query.lower() for k in web_keywords)
-
-    # 若偵測到問題具網路屬性 → 在 system prompt 中加強提示
     if needs_web:
         user_query = "[需要網路搜尋] " + user_query
 
-    # ------------------------------
-    # 第一次模型判斷要用哪些工具
-    # ------------------------------
-    first = safe_chat({
-        "model": CHAT_MODEL,
-        "messages": [
-            {"role": "system", "content": build_system_prompt()},
-            {"role": "user", "content": user_query},
-        ],
-        "tools": TOOL_DEFS,
-        "tool_choice": "auto",
-        "max_tokens": 500,
-    })
+    messages = [
+        {"role": "system", "content": build_system_prompt()},
+        {"role": "user", "content": user_query},
+    ]
 
-    assistant_msg = first.choices[0].message
-    tool_calls = assistant_msg.tool_calls
-    assistant_text = assistant_msg.content or ""
+    last_chart_path: Optional[str] = None
+    tool_call_counts: Dict[str, int] = {}  # 記錄每個 tool 被呼叫幾次
 
-    # ------------------------------
-    # 若沒有工具 → 回覆文字（仍可能 fallback 圖）
-    # ------------------------------
-    if not tool_calls:
-        final_text = assistant_text
-        last_chart_path = None
+    for iteration in range(MAX_ITERATIONS):
+        print(f"\n[Loop {iteration+1}] 開始")
+        time.sleep(1)  # 避免 RPM 超限
 
-    else:
-        # ------------------------------
-        # 執行工具
-        # ------------------------------
-        tool_messages = []
-        last_chart_path: Optional[str] = None
+        response = safe_chat({
+            "model": CHAT_MODEL,
+            "messages": messages,
+            "tools": TOOL_DEFS,
+            "tool_choice": "auto",
+            "max_tokens": 800,
+        })
 
+        assistant_msg = response.choices[0].message
+        tool_calls = assistant_msg.tool_calls
+
+        print(f"[Loop {iteration+1}] tool_calls: {[tc.function.name for tc in tool_calls] if tool_calls else '無，準備給答案'}")
+
+        # 沒有 tool call → GPT 認為答案夠了，結束
+        if not tool_calls:
+            print(f"[Loop {iteration+1}] 正常結束，回傳答案")
+            return assistant_msg.content or "", last_chart_path
+
+        # 把 assistant 決定加進歷史
+        messages.append({
+            "role": "assistant",
+            "content": assistant_msg.content,
+            "tool_calls": [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments,
+                    },
+                }
+                for tc in tool_calls
+            ],
+        })
+
+        # 執行 tools
         for tc in tool_calls:
             fn_name = tc.function.name
             try:
@@ -387,146 +423,84 @@ def agent_run(user_query: str) -> Tuple[str, Optional[str]]:
             except:
                 args = {}
 
+            # 累計呼叫次數
+            tool_call_counts[fn_name] = tool_call_counts.get(fn_name, 0) + 1
+
             impl = TOOL_IMPLS.get(fn_name)
+            if fn_name == "chart_generate":
+                print(f"[ChartDebug] GPT 傳來的 args: {args}")
             result = impl(**args) if impl else f"[ToolError] 未知工具：{fn_name}"
 
-            # 若為圖片工具 → 解析圖片路徑
             if fn_name == "chart_generate":
                 try:
                     obj = json.loads(result)
+                    print(f"[ChartDebug] status={obj.get('status')} path={obj.get('path')}")
                     if obj.get("status") == "ok":
                         p = obj.get("path")
+                        print(f"[ChartDebug] 檔案存在={os.path.exists(p) if p else False}")
                         if p and os.path.exists(p):
                             last_chart_path = p
-                except:
-                    pass
+                            print(f"[ChartDebug] last_chart_path 設定成功: {last_chart_path}")
+                        else:
+                            # path 存在但檔案找不到，可能是相對路徑問題
+                            # 嘗試在目前工作目錄尋找
+                            alt_path = os.path.join(os.getcwd(), p) if p else None
+                            print(f"[ChartDebug] 嘗試絕對路徑: {alt_path}")
+                            if alt_path and os.path.exists(alt_path):
+                                last_chart_path = alt_path
+                                print(f"[ChartDebug] 用絕對路徑成功: {last_chart_path}")
+                    else:
+                        # 失敗時加強提示，阻止 GPT 重試
+                        obj["note"] = "圖表生成失敗，請勿重複呼叫 chart_generate，直接用文字告知使用者錯誤原因。"
+                        result = json.dumps(obj, ensure_ascii=False)
+                except Exception as chart_err:
+                    print(f"[ChartDebug] 解析 result 失敗: {chart_err}, raw={result[:200]}")
 
-            tool_messages.append({
+            # 防止單一 tool result 太大塞爆 token
+            MAX_RESULT_CHARS = 3000
+            if len(result) > MAX_RESULT_CHARS:
+                result = result[:MAX_RESULT_CHARS] + "\n...[result truncated]"
+
+            messages.append({
                 "role": "tool",
                 "tool_call_id": tc.id,
                 "name": fn_name,
                 "content": result,
             })
 
-        # ------------------------------
-        # 第二次模型：整理文字回覆
-        # ------------------------------
-        follow = safe_chat({
-            "model": CHAT_MODEL,
-            "messages": [
-                {"role": "system","content": (
-                "你現在要根據工具結果，提供一份友善且清晰的最終回答。\n"
-                "請不要只重述工具輸出的內容，而要真的進行「資料分析」。\n\n"
-                "分析時請做到：\n"
-                "1. 解讀數據：指出最高、最低、明顯差距、前段與後段的落差。\n"
-                "2. 若是排行榜，請描述整體趨勢，例如是否前幾名特別突出。\n"
-                "3. 若有圖表，請說明圖表呈現的重點，例如集中程度、異常點。\n"
-                "4. 用貼近對話、溫暖且自然的繁體中文來說明，例如：\n"
-                "   -「可以看到前幾名的差距滿明顯的，我說明一下～」\n"
-                "   -「有趣的是，從數字可以看出...」\n"
-                "5. 不要編造不存在的欄位，也不要猜測未提供的資訊。\n"
-                    )
-                },
-                {"role": "user", "content": user_query},
-                {
-                    "role": "assistant",
-                    "tool_calls": [
-                        {
-                            "id": tc.id,
-                            "type": "function",
-                            "function": {
-                                "name": tc.function.name,
-                                "arguments": tc.function.arguments,
-                            },
-                        }
-                        for tc in tool_calls
-                    ],
-                },
-                *tool_messages,
-            ],
-            "max_tokens": 800,
-        })
+        # 若有任何 tool 被重複呼叫超過 2 次 → 強制整合
+        if any(v > 2 for v in tool_call_counts.values()):
+            print(f"[Loop {iteration+1}] 偵測到重複呼叫，強制整合答案")
+            break
 
-        final_text = follow.choices[0].message.content or ""
-
-    # ---------------------------------------------------------
-    # Auto Fallback：自動補圖（前 N 名 + 圖類型）
-    # ---------------------------------------------------------
-    need_chart = any(w in user_query for w in ["圖", "畫", "長條", "圓餅", "圖表", "視覺化"])
-    need_sales = any(w in user_query for w in ["銷售", "銷量", "熱銷", "排行", "前", "top"])
-
-    if last_chart_path is None and need_chart and need_sales and AUTO_SALES is not None:
-        
-        try:
-            # 擷取 N 與圖表類型
-            top_n = extract_top_n(user_query)
-            chart_type = extract_chart_type(user_query)
-
-            # 選資料 Top N
-            df = AUTO_SALES.sort_values("review_count", ascending=False).head(top_n)
-
-            # 建立資料摘要（讓模型能分析數據）
-            summary = "本次前 {} 名的評論數如下：\n".format(top_n)
-            summary += "\n".join([
-                f"{i+1}. {row['title']} — {row['review_count']}"
-                for i, row in df.iterrows()
-            ])
-            final_text += "\n\n" + summary + "\n"
-
-            # 構造 fallback 專用 spec
-            spec = {
-                "csv_name": "auto_sales",
-                "x": "title",
-                "y": "review_count",
-                "chart_type": chart_type
-            }
-
-            raw = chart_generate(spec)
-            obj = json.loads(raw)
-
-
-            if obj.get("status") == "ok":
-                p = obj.get("path")
-                if p and os.path.exists(p):
-                    last_chart_path = p
-                    final_text += f"\n\n（已根據你的需求，自動繪製前 {top_n} 名的 {chart_type} 圖。）"
-
-        except Exception as e:
-            final_text += f"\n\n[AutoChartFallbackError] {e}"
-
-    # ------------------------------
-    # 回傳文字 + 圖片路徑
-    # ------------------------------
-    return final_text, last_chart_path
+    # 超過 MAX_ITERATIONS 或重複呼叫 → 強制整合現有結果
+    print("[Agent] 強制整合最終答案")
+    final = safe_chat({
+        "model": CHAT_MODEL,
+        "messages": messages,
+        "max_tokens": 800,
+        # 不傳 tools，強制只給文字答案
+    })
+    return final.choices[0].message.content or "", last_chart_path
 
 # =========================================================
 # Chatbot 內顯示縮圖；下方顯示完整大圖
 # =========================================================
 
 def format_with_image(text: str, img_path: Optional[str]) -> str:
-    """
-    Chatbot 內顯示縮圖（固定寬度、保持比例）
-    下方的 gr.Image 會顯示完整大圖
-    """
     if img_path and os.path.exists(img_path):
         with open(img_path, "rb") as f:
             b64 = base64.b64encode(f.read()).decode()
         data_uri = f"data:image/png;base64,{b64}"
-
         return (
             text +
             f'\n\n<img src="{data_uri}" '
             f'style="width:100%; height:auto; border-radius:10px;">'
         )
-
     return text
 
 
 def chat_respond(msg: str, history: List[List[str]]):
-    """
-    - Chatbot: 回傳文字 + 縮圖
-    - big_img: 回傳完整 png 檔路徑
-    """
     if history is None:
         history = []
 
@@ -570,7 +544,6 @@ if __name__ == "__main__":
             label="對話區"
         )
 
-        # 下方完整大圖區域
         big_img = gr.Image(
             label="完整圖表預覽",
             interactive=False
@@ -586,21 +559,18 @@ if __name__ == "__main__":
             send_btn = gr.Button("送出", variant="primary")
             clear_btn = gr.Button("清除")
 
-        # Enter
         msg.submit(
             fn=chat_respond,
             inputs=[msg, chatbot],
             outputs=[chatbot, msg, big_img]
         )
 
-        # 按鈕送出
         send_btn.click(
             fn=chat_respond,
             inputs=[msg, chatbot],
             outputs=[chatbot, msg, big_img]
         )
 
-        # 清除
         clear_btn.click(
             fn=clear_all,
             outputs=[chatbot, msg, big_img]
